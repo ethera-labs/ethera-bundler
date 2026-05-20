@@ -115,12 +115,22 @@ For each request:
 ## Development
 
 ```sh
-make build           # cargo build --workspace
+make build           # cargo build --workspace --release
 make test            # cargo test --workspace --all-targets
 make fmt             # cargo fmt --all
 make lint            # cargo clippy --workspace --all-targets -- -D warnings
 make pr              # fmt-check + lint + test (run before opening a PR)
 ```
+
+First-time setup:
+
+```sh
+make install-tools   # cargo-deny, cargo-machete, pre-commit
+make install-hooks   # wire pre-commit into .git/hooks
+```
+
+Pre-commit then runs `cargo fmt`, `cargo clippy`, `cargo deny`, and
+`cargo machete` on every commit — see [`.pre-commit-config.yaml`](./.pre-commit-config.yaml).
 
 Toolchain pinned to Rust 1.91 via [`rust-toolchain.toml`](./rust-toolchain.toml).
 Workspace-wide lints (including `clippy::pedantic`-style rules) are configured

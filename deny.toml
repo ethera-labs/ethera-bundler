@@ -1,36 +1,47 @@
-# cargo-deny configuration. See https://embarkstudios.github.io/cargo-deny/.
-
-[graph]
-all-features = false
-no-default-features = false
-
 [advisories]
-version = 2
-ignore = []
+yanked = "warn"
+ignore = ["RUSTSEC-2024-0436"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+deny = [{ name = "openssl" }]
+skip = []
+skip-tree = []
 
 [licenses]
 version = 2
+confidence-threshold = 0.8
 allow = [
     "MIT",
+    "MIT-0",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
     "ISC",
-    "Unicode-DFS-2016",
+    "Unlicense",
     "Unicode-3.0",
     "Zlib",
-    "MPL-2.0",
-    "CC0-1.0",
-    "OpenSSL",
+    "LicenseRef-rustls-webpki",
+    "CDLA-Permissive-2.0",
+    "GPL-3.0-only",
 ]
-confidence-threshold = 0.8
+exceptions = []
 
-[bans]
-multiple-versions = "warn"
-wildcards = "warn"
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[[licenses.clarify]]
+name = "rustls-webpki"
+expression = "LicenseRef-rustls-webpki"
+license-files = [{ path = "LICENSE", hash = 0x001c7e6c }]
 
 [sources]
-unknown-registry = "deny"
+unknown-registry = "warn"
 unknown-git = "deny"
-allow-registry = ["https://github.com/rust-lang/crates.io-index"]

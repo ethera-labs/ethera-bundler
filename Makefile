@@ -69,8 +69,23 @@ check: ## Type-check the workspace without producing binaries.
 deny: ## Run cargo-deny supply-chain checks (requires cargo-deny installed).
 	$(CARGO) deny check
 
+.PHONY: machete
+machete: ## Find unused workspace dependencies (requires cargo-machete installed).
+	$(CARGO) machete
+
 .PHONY: pr
 pr: fmt-check lint test ## Run the full pre-PR gate (fmt-check + lint + test).
+
+##@ Tooling
+
+.PHONY: install-tools
+install-tools: ## Install cargo-deny, cargo-machete, and pre-commit.
+	$(CARGO) install --locked cargo-deny cargo-machete
+	@command -v pre-commit >/dev/null 2>&1 || pip install --user pre-commit
+
+.PHONY: install-hooks
+install-hooks: ## Wire pre-commit into this clone's .git/hooks.
+	pre-commit install
 
 ##@ Docker
 
