@@ -1,0 +1,23 @@
+[package]
+name = "ethera-bundler"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ethera-bundler"
+path = "src/main.rs"
+
+[dependencies]
+ethera-bundler-core = { workspace = true }
+
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+jsonrpsee = { workspace = true }

@@ -1,0 +1,74 @@
+[workspace.package]
+edition = "2021"
+rust-version = "1.91"
+license = "GPL-3.0-only"
+
+[workspace]
+members = [
+    "bin/ethera-bundler",
+    "crates/bundler",
+]
+resolver = "2"
+
+[workspace.dependencies]
+ethera-bundler-core = { path = "crates/bundler" }
+
+# Async
+tokio = { version = "1.43", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Ethereum
+alloy = { version = "1.7", features = [
+    "sol-types", "consensus", "network",
+    "signers", "signer-local", "providers", "provider-http",
+    "rpc-types", "rlp", "k256",
+] }
+alloy-rpc-types-eth = "1.7"
+
+# JSON-RPC server
+jsonrpsee = { version = "0.24", features = ["server", "macros"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Serde
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Misc
+hex = "0.4"
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_must_use = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+doc_markdown = "warn"
+derive_partial_eq_without_eq = "warn"
+uninlined_format_args = "warn"
+redundant_else = "warn"
+flat_map_option = "warn"
+manual_let_else = "warn"
+cloned_instead_of_copied = "warn"
+explicit_iter_loop = "warn"
+match_wildcard_for_single_variants = "warn"
+semicolon_if_nothing_returned = "warn"
+use_self = "warn"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
