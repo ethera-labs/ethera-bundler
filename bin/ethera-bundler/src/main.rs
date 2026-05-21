@@ -10,6 +10,8 @@ use ethera_bundler_core::provider::AlloyProvider;
 use ethera_bundler_core::rpc::{BundlerRpc, EtheraBundlerApiServer};
 use ethera_bundler_core::signer::{LocalSigner, Signer};
 use jsonrpsee::server::Server;
+use tower::ServiceBuilder;
+use tower_http::cors::{Any, CorsLayer};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -43,7 +45,16 @@ async fn main() -> anyhow::Result<()> {
     let listen_addr = cfg.listen_addr;
     let rpc = BundlerRpc::new(bundler);
 
+    // Permissive CORS so browser-based clients
+    // can call the bundler from a different origin.
+    let cors = CorsLayer::new()
+        .allow_methods(Any)
+        .allow_headers(Any)
+        .allow_origin(Any);
+    let middleware = ServiceBuilder::new().layer(cors);
+
     let server = Server::builder()
+        .set_http_middleware(middleware)
         .build(listen_addr)
         .await
         .with_context(|| format!("failed to bind JSON-RPC server on {listen_addr}"))?;

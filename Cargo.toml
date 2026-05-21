@@ -26,8 +26,9 @@ alloy = { version = "1.7", features = [
 ] }
 alloy-rpc-types-eth = "1.7"
 
-# JSON-RPC server
 jsonrpsee = { version = "0.24", features = ["server", "macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
