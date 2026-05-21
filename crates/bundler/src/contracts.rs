@@ -6,6 +6,16 @@
 
 use alloy::sol;
 
+/// `EntryPointSimulations` deployed runtime bytecode, compiled from
+/// `eth-infinitism/account-abstraction@releases/v0.7`. Applied as an
+/// `eth_call` state override against the live `EntryPoint` address so the
+/// bundler can invoke `simulateValidation` without a dedicated deployment.
+///
+/// Regenerate with `forge inspect contracts/core/EntryPointSimulations.sol:EntryPointSimulations deployedBytecode`
+/// when bumping to a new ERC-4337 release.
+pub const ENTRYPOINT_SIMULATIONS_RUNTIME_V07: &[u8] =
+    include_bytes!("../assets/entrypoint_simulations_v07.bin");
+
 sol! {
     /// Packed onchain encoding of a v0.7 `UserOperation`. The JSON-RPC wire format
     /// is *unpacked*; see [`crate::packing::pack`] for the conversion.

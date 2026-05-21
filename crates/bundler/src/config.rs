@@ -41,14 +41,6 @@ pub struct BundlerConfig {
     #[arg(long, env = "ETHERA_BUNDLER_ENTRYPOINT_ADDRESS", default_value_t = ENTRYPOINT_V07)]
     pub entrypoint_address: Address,
 
-    /// `EntryPointSimulations` deployed bytecode, hex-encoded.
-    ///
-    /// Used as the `code` field of an `eth_call` state override so that
-    /// `simulateValidation` can be invoked against the live `EntryPoint`
-    /// address. v0.7 defines this method on a separate contract.
-    #[arg(long, env = "ETHERA_BUNDLER_ENTRYPOINT_SIMULATIONS_CODE")]
-    pub entrypoint_simulations_code: String,
-
     /// Sequencer signing key (32-byte hex, with or without `0x` prefix).
     #[arg(long, env = "ETHERA_BUNDLER_SEQUENCER_KEY")]
     pub sequencer_key: B256,
