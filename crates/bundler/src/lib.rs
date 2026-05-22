@@ -5,6 +5,7 @@
 pub mod bundler;
 pub mod config;
 pub mod contracts;
+pub mod discovery;
 pub mod errors;
 pub mod packing;
 pub mod provider;

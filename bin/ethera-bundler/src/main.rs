@@ -6,6 +6,7 @@ use anyhow::Context;
 use clap::Parser;
 use ethera_bundler_core::bundler::Bundler;
 use ethera_bundler_core::config::BundlerConfig;
+use ethera_bundler_core::discovery::{DiscoveryRpc, EthDiscoveryApiServer, Web3DiscoveryApiServer};
 use ethera_bundler_core::provider::AlloyProvider;
 use ethera_bundler_core::rpc::{BundlerRpc, EtheraBundlerApiServer};
 use ethera_bundler_core::signer::{LocalSigner, Signer};
@@ -43,7 +44,16 @@ async fn main() -> anyhow::Result<()> {
         Bundler::new(cfg.clone(), provider, signer).context("failed to construct bundler")?,
     );
     let listen_addr = cfg.listen_addr;
+    let discovery = DiscoveryRpc::new(cfg.chain_id, cfg.entrypoint_address);
     let rpc = BundlerRpc::new(bundler);
+
+    let mut module = rpc.into_rpc();
+    module
+        .merge(EthDiscoveryApiServer::into_rpc(discovery.clone()))
+        .context("failed to merge eth discovery rpc")?;
+    module
+        .merge(Web3DiscoveryApiServer::into_rpc(discovery))
+        .context("failed to merge web3 discovery rpc")?;
 
     // Permissive CORS so browser-based clients
     // can call the bundler from a different origin.
@@ -58,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
         .build(listen_addr)
         .await
         .with_context(|| format!("failed to bind JSON-RPC server on {listen_addr}"))?;
-    let handle = server.start(rpc.into_rpc());
+    let handle = server.start(module);
     tracing::info!(%listen_addr, "JSON-RPC server listening");
 
     tokio::signal::ctrl_c()
