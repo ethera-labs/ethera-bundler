@@ -3,6 +3,8 @@
 
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use alloy::consensus::TxEnvelope;
 use alloy::eips::eip2718::Decodable2718;
 use alloy::primitives::{address, b256, bytes, Address, Bytes, B256, U256};
@@ -13,7 +15,7 @@ use ethera_bundler_core::config::{BundlerConfig, ENTRYPOINT_V07};
 use ethera_bundler_core::contracts::{
     AggregatorStakeInfo, IEntryPoint, PackedUserOperation, ReturnInfo, StakeInfo, ValidationResult,
 };
-use ethera_bundler_core::provider::{EthProvider, ProviderError};
+use ethera_bundler_core::provider::{EthProvider, ProviderError, ReceiptInfo};
 use ethera_bundler_core::signer::LocalSigner;
 use ethera_bundler_core::types::{BuildOpts, UserOpV07};
 
@@ -30,12 +32,14 @@ const TEST_USER_OP_HASH: B256 =
 #[derive(Debug, Clone)]
 struct MockProvider {
     deposit: U256,
+    submissions: Arc<std::sync::Mutex<Vec<Bytes>>>,
 }
 
 impl Default for MockProvider {
     fn default() -> Self {
         Self {
             deposit: U256::from(TEST_DEPOSIT),
+            submissions: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 }
@@ -69,6 +73,32 @@ impl EthProvider for MockProvider {
         _op: PackedUserOperation,
     ) -> Result<B256, ProviderError> {
         Ok(TEST_USER_OP_HASH)
+    }
+    async fn send_raw_transaction(&self, raw: Bytes) -> Result<B256, ProviderError> {
+        let envelope = TxEnvelope::decode_2718(&mut raw.as_ref())
+            .map_err(|e| ProviderError::Decode(e.to_string()))?;
+        let hash = *envelope.tx_hash();
+        self.submissions.lock().unwrap().push(raw);
+        Ok(hash)
+    }
+    async fn wait_for_receipt(
+        &self,
+        hash: B256,
+        _timeout: Duration,
+    ) -> Result<Option<ReceiptInfo>, ProviderError> {
+        Ok(Some(ReceiptInfo {
+            tx_hash: hash,
+            block_number: 1,
+            success: true,
+        }))
+    }
+    async fn try_call_for_revert(
+        &self,
+        _from: Address,
+        _to: Address,
+        _data: Bytes,
+    ) -> Result<Option<Bytes>, ProviderError> {
+        Ok(None)
     }
     async fn estimate_handle_ops_gas(
         &self,
@@ -250,6 +280,7 @@ async fn rejects_priority_fee_below_minimum() {
 async fn rejects_insufficient_deposit() {
     let provider = MockProvider {
         deposit: U256::from(1u64),
+        ..MockProvider::default()
     };
     let cfg = test_config();
     let signer = Arc::new(LocalSigner::from_key(TEST_KEY).unwrap());
@@ -268,41 +299,29 @@ async fn rejects_insufficient_deposit() {
     assert!(err.contains("insufficient deposit"), "got: {err}");
 }
 
-/// Two back-to-back builds against the same `Bundler` must produce a
-/// monotonically increasing nonce, even though `MockProvider::pending_nonce`
-/// always returns `TEST_NONCE`. Regression test for the cached nonce mutex
-/// that prevents the same nonce from being signed twice under concurrency.
+/// Each `build_signed_user_ops_tx` call must broadcast the signed tx via
+/// `send_raw_transaction` before returning. The bundler owns submission so
+/// the chain - not an internal counter - is the source of truth for the
+/// next nonce.
 #[tokio::test]
-async fn sequential_builds_increment_nonce_locally() {
+async fn build_submits_raw_transaction_to_provider() {
+    let provider = MockProvider::default();
+    let submissions = provider.submissions.clone();
     let cfg = test_config();
     let signer = Arc::new(LocalSigner::from_key(TEST_KEY).unwrap());
-    let bundler = Bundler::new(cfg, Arc::new(MockProvider::default()), signer).unwrap();
+    let bundler = Bundler::new(cfg, Arc::new(provider), signer).unwrap();
     let opts = BuildOpts {
         chain_id: TEST_CHAIN_ID,
     };
 
-    let first = bundler
-        .build_signed_user_ops_tx(vec![happy_op()], opts.clone())
-        .await
-        .unwrap();
-    let second = bundler
+    let resp = bundler
         .build_signed_user_ops_tx(vec![happy_op()], opts)
         .await
         .unwrap();
 
-    let first_tx = decode_eip1559(&first.raw);
-    let second_tx = decode_eip1559(&second.raw);
-    assert_eq!(first_tx.nonce, TEST_NONCE);
-    assert_eq!(second_tx.nonce, TEST_NONCE + 1);
-}
-
-fn decode_eip1559(raw: &Bytes) -> alloy::consensus::TxEip1559 {
-    let envelope =
-        TxEnvelope::decode_2718(&mut raw.as_ref()).expect("raw must be EIP-2718-encoded");
-    let TxEnvelope::Eip1559(signed) = envelope else {
-        panic!("expected EIP-1559 envelope, got {envelope:?}");
-    };
-    signed.tx().clone()
+    let captured = submissions.lock().unwrap().clone();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0], resp.raw);
 }
 
 // Convenience for the test: expose the signer's address without dragging in

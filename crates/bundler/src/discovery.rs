@@ -1,15 +1,15 @@
 //! Read-only discovery shims used by wallet SDKs and tooling to identify
 //! the bundler before sending a `UserOp`:
 //!
-//! * `eth_chainId` ([EIP-695]) — confirm the bundler is on the expected chain.
-//! * `eth_supportedEntryPoints` ([ERC-4337]) — discover the `EntryPoint` to
+//! * `eth_chainId` ([EIP-695]) - confirm the bundler is on the expected chain.
+//! * `eth_supportedEntryPoints` ([ERC-4337]) - discover the `EntryPoint` to
 //!   target when building `UserOps`.
-//! * `web3_clientVersion` — human-readable build identifier for logs and
+//! * `web3_clientVersion` - human-readable build identifier for logs and
 //!   bug reports.
 //!
 //! This is intentionally a partial surface: the full ERC-4337 RPC
 //! (`eth_sendUserOperation`, `eth_estimateUserOperationGas`, ...) is not
-//! exposed because this bundler does not run a public mempool — `UserOps`
+//! exposed because this bundler does not run a public mempool - `UserOps`
 //! arrive pre-batched through [`crate::rpc`].
 //!
 //! [EIP-695]: https://eips.ethereum.org/EIPS/eip-695

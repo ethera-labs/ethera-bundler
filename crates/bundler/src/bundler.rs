@@ -16,7 +16,7 @@
 //! 8. Build & sign type-2 tx.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::consensus::TxEip1559;
 use alloy::eips::eip2718::Encodable2718;
@@ -27,22 +27,37 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::BundlerConfig;
 use crate::contracts::{IEntryPoint, PackedUserOperation};
-use crate::errors::BundlerError;
+use crate::errors::{decode_handle_ops_revert, BundlerError};
 use crate::packing::{self, parse_paymaster_and_data};
 use crate::provider::EthProvider;
 use crate::signer::Signer;
 use crate::types::{BuildOpts, SignedTxResp, UserOpV07};
 use crate::validator;
 
+/// Upper bound on the receipt wait. OP-stack rollups with
+/// flashblocks confirm in well under a second; 30s leaves headroom for
+/// degraded conditions without holding a JSON-RPC connection indefinitely.
+/// TODO: config?
+const RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct Bundler<P: EthProvider + ?Sized, S: Signer + ?Sized> {
     cfg: BundlerConfig,
     provider: Arc<P>,
     signer: Arc<S>,
     simulations_code: Bytes,
-    /// Serializes the nonce-take + sign step across concurrent build calls and
-    /// caches the next nonce so two callers don't both fetch `pending_nonce`
-    /// and sign with the same value.
-    nonce_state: Mutex<Option<u64>>,
+    /// Serializes the nonce-fetch → sign → submit critical section across
+    /// concurrent build calls. Holding the lock across `send_raw_transaction`
+    /// guarantees the next caller's `pending_nonce` reflects the
+    /// just-submitted tx.
+    ///
+    /// TODO: consider reading `latest` nonce instead of `pending`. That
+    /// would require extending the lock to cover `wait_for_receipt` so the
+    /// previous tx is mined before the next caller fetches. Impact:
+    /// throughput drops to ~1 build per block (≥200ms on flashblocks,
+    /// ≥2s without), but the bundler stops issuing nonces for txs that
+    /// are still in the mempool - useful if we ever see pool eviction
+    /// or want to detect dropped txs without polling.
+    submit_lock: Mutex<()>,
     /// External shutdown signal. The build pipeline races on it and returns
     /// [`BundlerError::Cancelled`] when fired, so a SIGINT doesn't have to
     /// wait for a wedged provider call.
@@ -82,7 +97,7 @@ impl<P: EthProvider + ?Sized, S: Signer + ?Sized> Bundler<P, S> {
             provider,
             signer,
             simulations_code: default_simulations_code(),
-            nonce_state: Mutex::new(None),
+            submit_lock: Mutex::new(()),
             cancel,
         })
     }
@@ -175,11 +190,8 @@ impl<P: EthProvider + ?Sized, S: Signer + ?Sized> Bundler<P, S> {
             min_user_fee_cap.expect("non-empty batch"),
         )?;
 
-        let mut nonce_slot = self.nonce_state.lock().await;
-        let nonce = match *nonce_slot {
-            Some(n) => n,
-            None => self.provider.pending_nonce(beneficiary).await?,
-        };
+        let submit_guard = self.submit_lock.lock().await;
+        let nonce = self.provider.pending_nonce(beneficiary).await?;
 
         let tx = TxEip1559 {
             chain_id: self.cfg.chain_id,
@@ -190,15 +202,37 @@ impl<P: EthProvider + ?Sized, S: Signer + ?Sized> Bundler<P, S> {
             to: TxKind::Call(self.cfg.entrypoint_address),
             value: U256::ZERO,
             access_list: Default::default(),
-            input: call_data,
+            input: call_data.clone(),
         };
 
         let envelope = self.signer.sign_eip1559(tx).await?;
-        *nonce_slot = Some(nonce.saturating_add(1));
-        drop(nonce_slot);
-
         let raw = Bytes::from(envelope.encoded_2718());
         let hash = *envelope.tx_hash();
+
+        let submitted = self.provider.send_raw_transaction(raw.clone()).await?;
+        debug_assert_eq!(submitted, hash, "submitted hash must match signed envelope");
+        drop(submit_guard);
+
+        let receipt = self
+            .provider
+            .wait_for_receipt(hash, RECEIPT_TIMEOUT)
+            .await?
+            .ok_or(BundlerError::ReceiptTimeout { tx_hash: hash })?;
+        if !receipt.success {
+            let reason = match self
+                .provider
+                .try_call_for_revert(beneficiary, self.cfg.entrypoint_address, call_data)
+                .await?
+            {
+                Some(data) => decode_handle_ops_revert(&data),
+                None => crate::errors::HandleOpsRevertReason::Unknown(Bytes::new()),
+            };
+            return Err(BundlerError::HandleOpsReverted {
+                tx_hash: hash,
+                block_number: receipt.block_number,
+                reason,
+            });
+        }
 
         Ok(SignedTxResp {
             raw,

@@ -3,6 +3,8 @@
 //! Centralizing them here keeps the bundler core mockable: tests inject a
 //! [`MockEthProvider`]-style impl without touching real RPC.
 
+use std::time::{Duration, Instant};
+
 use alloy::eips::BlockNumberOrTag;
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, Bytes, B256, U256};
@@ -23,6 +25,14 @@ pub enum ProviderError {
     EmptyCall,
     #[error("abi decode failed: {0}")]
     Decode(String),
+}
+
+/// Outcome of awaiting a submitted transaction's receipt.
+#[derive(Debug, Clone)]
+pub struct ReceiptInfo {
+    pub tx_hash: B256,
+    pub block_number: u64,
+    pub success: bool,
 }
 
 /// All EL interactions the bundler needs. Mock for tests, real impl for prod.
@@ -60,6 +70,29 @@ pub trait EthProvider: Send + Sync + 'static {
         entrypoint: Address,
         call_data: Bytes,
     ) -> Result<u64, ProviderError>;
+
+    /// Broadcast an EIP-2718-encoded signed transaction and return the
+    /// resulting tx hash once the node has accepted it into the mempool.
+    async fn send_raw_transaction(&self, raw: Bytes) -> Result<B256, ProviderError>;
+
+    /// Poll for the receipt of a submitted transaction until it lands or the
+    /// timeout elapses. Returns `None` on timeout so the caller can surface
+    /// a domain-specific error instead of a transport error.
+    async fn wait_for_receipt(
+        &self,
+        hash: B256,
+        timeout: Duration,
+    ) -> Result<Option<ReceiptInfo>, ProviderError>;
+
+    /// Replay an `eth_call` against the latest block, returning the revert
+    /// bytes when the call reverts. Used after a failed receipt to recover
+    /// the `FailedOp*` reason that the node already knew at mining time.
+    async fn try_call_for_revert(
+        &self,
+        from: Address,
+        to: Address,
+        call_data: Bytes,
+    ) -> Result<Option<Bytes>, ProviderError>;
 
     /// Simulate `IEntryPointSimulations.simulateValidation(op)` via
     /// `eth_call` with a state-override that swaps `EntryPoint`'s runtime code
@@ -184,6 +217,63 @@ impl EthProvider for AlloyProvider {
             .estimate_gas(tx)
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))
+    }
+
+    async fn send_raw_transaction(&self, raw: Bytes) -> Result<B256, ProviderError> {
+        let pending = self
+            .inner
+            .send_raw_transaction(&raw)
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        Ok(*pending.tx_hash())
+    }
+
+    async fn wait_for_receipt(
+        &self,
+        hash: B256,
+        timeout: Duration,
+    ) -> Result<Option<ReceiptInfo>, ProviderError> {
+        let deadline = Instant::now() + timeout;
+        let mut backoff = Duration::from_millis(200);
+        loop {
+            if let Some(r) = self
+                .inner
+                .get_transaction_receipt(hash)
+                .await
+                .map_err(|e| ProviderError::Transport(e.to_string()))?
+            {
+                return Ok(Some(ReceiptInfo {
+                    tx_hash: hash,
+                    block_number: r.block_number.unwrap_or_default(),
+                    success: r.status(),
+                }));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            let sleep = backoff.min(deadline - now);
+            tokio::time::sleep(sleep).await;
+            backoff = (backoff * 2).min(Duration::from_secs(2));
+        }
+    }
+
+    async fn try_call_for_revert(
+        &self,
+        from: Address,
+        to: Address,
+        call_data: Bytes,
+    ) -> Result<Option<Bytes>, ProviderError> {
+        let tx = TransactionRequest::default()
+            .with_from(from)
+            .with_to(to)
+            .with_input(call_data);
+        match self.inner.call(tx).await {
+            Ok(_) => Ok(None),
+            Err(err) => Ok(err
+                .as_error_resp()
+                .and_then(|payload| payload.as_revert_data())),
+        }
     }
 
     async fn simulate_validation(

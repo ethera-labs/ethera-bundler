@@ -4,8 +4,11 @@
 //!
 //! [spec]: https://eips.ethereum.org/EIPS/eip-4337#error-codes
 
+use alloy::primitives::Bytes;
+use alloy::sol_types::{SolError, SolValue};
 use serde_json::{json, Value};
 
+use crate::contracts::IEntryPoint;
 use crate::packing::PackError;
 use crate::provider::ProviderError;
 use crate::signer::SignerError;
@@ -67,6 +70,16 @@ pub enum BundlerError {
 
     #[error("bundler is shutting down")]
     Cancelled,
+
+    #[error("receipt for {tx_hash:?} not found within timeout")]
+    ReceiptTimeout { tx_hash: alloy::primitives::B256 },
+
+    #[error("handleOps reverted on-chain: {reason}")]
+    HandleOpsReverted {
+        tx_hash: alloy::primitives::B256,
+        block_number: u64,
+        reason: HandleOpsRevertReason,
+    },
 
     #[error(transparent)]
     Pack(#[from] PackError),
@@ -144,6 +157,21 @@ pub fn classify(err: &BundlerError) -> (i32, Value) {
             codes::INTERNAL_ERROR,
             json!({ "reason": "shutdown in progress" }),
         ),
+        BundlerError::ReceiptTimeout { tx_hash } => (
+            codes::INTERNAL_ERROR,
+            json!({ "reason": "receiptTimeout", "txHash": format!("{tx_hash:?}") }),
+        ),
+        BundlerError::HandleOpsReverted {
+            tx_hash,
+            block_number,
+            reason,
+        } => {
+            let (code, payload) = reason.classify();
+            let mut payload = payload;
+            payload["txHash"] = json!(format!("{tx_hash:?}"));
+            payload["blockNumber"] = json!(block_number);
+            (code, payload)
+        }
         BundlerError::Pack(e) => (codes::INVALID_PARAMS, json!({ "reason": e.to_string() })),
         BundlerError::Validation(e) => match e {
             ValidationError::AccountSignatureFailed => (
@@ -181,5 +209,211 @@ pub fn classify(err: &BundlerError) -> (i32, Value) {
         },
         BundlerError::Provider(e) => (codes::INTERNAL_ERROR, json!({ "reason": e.to_string() })),
         BundlerError::Signer(e) => (codes::INTERNAL_ERROR, json!({ "reason": e.to_string() })),
+    }
+}
+
+/// Decoded `handleOps` revert. Variants mirror the `error` declarations on
+/// the v0.7 `EntryPoint` contract (`FailedOp`, `FailedOpWithRevert`,
+/// `SignatureValidationFailed`, `PostOpReverted`) plus the two standard
+/// Solidity revert encodings (`Error(string)`, `Panic(uint256)`). Unknown
+/// selectors fall through to [`Self::Unknown`] with the raw bytes preserved.
+#[derive(Debug, Clone)]
+pub enum HandleOpsRevertReason {
+    FailedOp {
+        op_index: u64,
+        reason: String,
+    },
+    FailedOpWithRevert {
+        op_index: u64,
+        reason: String,
+        inner: Bytes,
+    },
+    SignatureValidationFailed {
+        aggregator: alloy::primitives::Address,
+    },
+    PostOpReverted {
+        return_data: Bytes,
+    },
+    StandardError(String),
+    Panic(u64),
+    /// Selector matched none of the known shapes; `data` carries the raw
+    /// revert bytes so operators can post-mortem from the logs.
+    Unknown(Bytes),
+}
+
+impl std::fmt::Display for HandleOpsRevertReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FailedOp { op_index, reason } => write!(f, "FailedOp[{op_index}]: {reason}"),
+            Self::FailedOpWithRevert {
+                op_index, reason, ..
+            } => write!(f, "FailedOpWithRevert[{op_index}]: {reason}"),
+            Self::SignatureValidationFailed { aggregator } => {
+                write!(f, "SignatureValidationFailed: aggregator={aggregator:?}")
+            }
+            Self::PostOpReverted { .. } => write!(f, "PostOpReverted"),
+            Self::StandardError(m) => write!(f, "Error({m})"),
+            Self::Panic(c) => write!(f, "Panic(0x{c:x})"),
+            Self::Unknown(b) => write!(f, "unknown revert: 0x{}", hex::encode(b)),
+        }
+    }
+}
+
+impl HandleOpsRevertReason {
+    /// JSON-RPC error code + payload for this revert. AA-prefixed reasons
+    /// hint at the failing layer: `AA3*` is paymaster, anything else is
+    /// account/EntryPoint.
+    pub fn classify(&self) -> (i32, Value) {
+        match self {
+            Self::FailedOp { op_index, reason }
+            | Self::FailedOpWithRevert {
+                op_index, reason, ..
+            } => {
+                let code = if reason.starts_with("AA3") {
+                    codes::PAYMASTER_REJECTED
+                } else {
+                    codes::SIMULATE_VALIDATION_REJECTED
+                };
+                (code, json!({ "reason": reason, "opIndex": op_index }))
+            }
+            Self::SignatureValidationFailed { aggregator } => (
+                codes::SIMULATE_VALIDATION_REJECTED,
+                json!({
+                    "reason": "SignatureValidationFailed",
+                    "aggregator": format!("{aggregator:?}"),
+                }),
+            ),
+            Self::PostOpReverted { return_data } => (
+                codes::PAYMASTER_REJECTED,
+                json!({ "reason": "PostOpReverted", "returnData": format!("0x{}", hex::encode(return_data)) }),
+            ),
+            Self::StandardError(message) => (
+                codes::SIMULATE_VALIDATION_REJECTED,
+                json!({ "reason": "Error(string)", "message": message }),
+            ),
+            Self::Panic(code) => (
+                codes::SIMULATE_VALIDATION_REJECTED,
+                json!({ "reason": "Panic(uint256)", "code": format!("0x{code:x}") }),
+            ),
+            Self::Unknown(raw) => (
+                codes::INTERNAL_ERROR,
+                json!({ "reason": "undecodedRevert", "data": format!("0x{}", hex::encode(raw)) }),
+            ),
+        }
+    }
+}
+
+const ERROR_STRING_SELECTOR: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
+const PANIC_UINT_SELECTOR: [u8; 4] = [0x4e, 0x48, 0x7b, 0x71];
+
+/// Match the first 4 bytes of `data` against the `EntryPoint` custom errors
+/// and the two Solidity standard revert encodings. Returns
+/// [`HandleOpsRevertReason::Unknown`] on shape mismatch so the caller still
+/// gets the raw bytes.
+pub fn decode_handle_ops_revert(data: &[u8]) -> HandleOpsRevertReason {
+    let Some(selector) = data.get(0..4) else {
+        return HandleOpsRevertReason::Unknown(Bytes::copy_from_slice(data));
+    };
+    let body = &data[4..];
+
+    if selector == IEntryPoint::FailedOp::SELECTOR.as_slice() {
+        if let Ok(decoded) = IEntryPoint::FailedOp::abi_decode_raw(body) {
+            return HandleOpsRevertReason::FailedOp {
+                op_index: clamp_u64(decoded.opIndex),
+                reason: decoded.reason,
+            };
+        }
+    } else if selector == IEntryPoint::FailedOpWithRevert::SELECTOR.as_slice() {
+        if let Ok(decoded) = IEntryPoint::FailedOpWithRevert::abi_decode_raw(body) {
+            return HandleOpsRevertReason::FailedOpWithRevert {
+                op_index: clamp_u64(decoded.opIndex),
+                reason: decoded.reason,
+                inner: decoded.inner,
+            };
+        }
+    } else if selector == IEntryPoint::SignatureValidationFailed::SELECTOR.as_slice() {
+        if let Ok(decoded) = IEntryPoint::SignatureValidationFailed::abi_decode_raw(body) {
+            return HandleOpsRevertReason::SignatureValidationFailed {
+                aggregator: decoded.aggregator,
+            };
+        }
+    } else if selector == IEntryPoint::PostOpReverted::SELECTOR.as_slice() {
+        if let Ok(decoded) = IEntryPoint::PostOpReverted::abi_decode_raw(body) {
+            return HandleOpsRevertReason::PostOpReverted {
+                return_data: decoded.returnData,
+            };
+        }
+    } else if selector == ERROR_STRING_SELECTOR {
+        if let Ok(s) = String::abi_decode(body) {
+            return HandleOpsRevertReason::StandardError(s);
+        }
+    } else if selector == PANIC_UINT_SELECTOR {
+        if let Ok(code) = alloy::primitives::U256::abi_decode(body) {
+            return HandleOpsRevertReason::Panic(clamp_u64(code));
+        }
+    }
+
+    HandleOpsRevertReason::Unknown(Bytes::copy_from_slice(data))
+}
+
+fn clamp_u64(v: alloy::primitives::U256) -> u64 {
+    u64::try_from(v).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::{address, U256};
+    use alloy::sol_types::SolError;
+
+    #[test]
+    fn decodes_failed_op() {
+        let encoded = IEntryPoint::FailedOp {
+            opIndex: U256::from(2),
+            reason: "AA21 didn't pay prefund".into(),
+        }
+        .abi_encode();
+        let decoded = decode_handle_ops_revert(&encoded);
+        let HandleOpsRevertReason::FailedOp { op_index, reason } = decoded else {
+            panic!("expected FailedOp, got {decoded:?}");
+        };
+        assert_eq!(op_index, 2);
+        assert_eq!(reason, "AA21 didn't pay prefund");
+    }
+
+    #[test]
+    fn decodes_signature_validation_failed() {
+        let agg = address!("0000000000000000000000000000000000000aaa");
+        let encoded = IEntryPoint::SignatureValidationFailed { aggregator: agg }.abi_encode();
+        let decoded = decode_handle_ops_revert(&encoded);
+        assert!(matches!(
+            decoded,
+            HandleOpsRevertReason::SignatureValidationFailed { aggregator } if aggregator == agg
+        ));
+    }
+
+    #[test]
+    fn decodes_standard_error_string() {
+        let mut encoded = ERROR_STRING_SELECTOR.to_vec();
+        encoded.extend_from_slice(&"boom".to_string().abi_encode());
+        let decoded = decode_handle_ops_revert(&encoded);
+        assert!(matches!(decoded, HandleOpsRevertReason::StandardError(s) if s == "boom"));
+    }
+
+    #[test]
+    fn paymaster_aa3_routes_to_paymaster_code() {
+        let r = HandleOpsRevertReason::FailedOp {
+            op_index: 0,
+            reason: "AA31 paymaster deposit too low".into(),
+        };
+        let (code, _) = r.classify();
+        assert_eq!(code, codes::PAYMASTER_REJECTED);
+    }
+
+    #[test]
+    fn unknown_selector_falls_through() {
+        let raw = vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0x02];
+        let decoded = decode_handle_ops_revert(&raw);
+        assert!(matches!(decoded, HandleOpsRevertReason::Unknown(b) if b == raw));
     }
 }

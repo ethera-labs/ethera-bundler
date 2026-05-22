@@ -6,7 +6,7 @@
 //! * RPC reachable and on the expected `chain_id` (mismatched chain = every
 //!   signed tx invalid, no client-visible signal until first call).
 //! * `EntryPoint` contract is actually deployed at the configured address.
-//! * Sequencer EOA exists and has enough balance to pay the outer tx — logged
+//! * Sequencer EOA exists and has enough balance to pay the outer tx - logged
 //!   as a warning rather than a hard failure, since funding can lag deploy.
 //!
 //! Failures here abort `main` before the JSON-RPC server binds; the operator
@@ -33,7 +33,7 @@ pub(crate) async fn probe(
         .context("eth_chainId probe failed")?;
     if actual_chain_id != chain_id {
         bail!(
-            "chain id mismatch: config={chain_id}, rpc={actual_chain_id} — bundler would sign \
+            "chain id mismatch: config={chain_id}, rpc={actual_chain_id} - bundler would sign \
              txs the chain rejects"
         );
     }
@@ -61,7 +61,7 @@ pub(crate) async fn probe(
         tracing::warn!(
             %sequencer,
             balance_wei = %balance,
-            "sequencer balance below 1 ETH equivalent — handleOps may run out of gas funds",
+            "sequencer balance below 1 ETH equivalent - handleOps may run out of gas funds",
         );
     } else {
         tracing::info!(%sequencer, balance_wei = %balance, "sequencer balance ok");
