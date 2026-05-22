@@ -15,8 +15,10 @@ path = "src/main.rs"
 [dependencies]
 ethera-bundler-core = { workspace = true }
 
+alloy = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }

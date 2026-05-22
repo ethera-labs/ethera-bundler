@@ -1643,11 +1643,13 @@ dependencies = [
 name = "ethera-bundler"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "anyhow",
  "clap",
  "ethera-bundler-core",
  "jsonrpsee",
  "tokio",
+ "tokio-util",
  "tower 0.4.13",
  "tower-http 0.5.2",
  "tracing",
@@ -1667,6 +1669,8 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
+ "tracing",
  "url",
 ]
 
@@ -4137,6 +4141,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
