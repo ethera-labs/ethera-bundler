@@ -115,8 +115,6 @@ fn test_config() -> BundlerConfig {
         chain_id: TEST_CHAIN_ID,
         exec_rpc_url: "http://localhost:0/unused".into(),
         entrypoint_address: ENTRYPOINT_V07,
-        // 2 bytes of bytecode is enough - the mock never executes it.
-        entrypoint_simulations_code: "0xfeed".into(),
         sequencer_key: TEST_KEY,
         max_batch_size: 10,
         min_priority_fee_wei: U256::from(1_000_000_000u64), // 1 gwei

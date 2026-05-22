@@ -39,6 +39,13 @@ pub struct Bundler<P: EthProvider + ?Sized, S: Signer + ?Sized> {
     simulations_code: Bytes,
 }
 
+/// Default simulations runtime - the embedded ERC-4337 v0.7
+/// `EntryPointSimulations` bytecode. Exposed for tests that want to assert
+/// against the same bytes the binary uses.
+pub fn default_simulations_code() -> Bytes {
+    Bytes::from_static(crate::contracts::ENTRYPOINT_SIMULATIONS_RUNTIME_V07)
+}
+
 impl<P: EthProvider + ?Sized, S: Signer + ?Sized> std::fmt::Debug for Bundler<P, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Bundler")
@@ -51,17 +58,11 @@ impl<P: EthProvider + ?Sized, S: Signer + ?Sized> std::fmt::Debug for Bundler<P,
 
 impl<P: EthProvider + ?Sized, S: Signer + ?Sized> Bundler<P, S> {
     pub fn new(cfg: BundlerConfig, provider: Arc<P>, signer: Arc<S>) -> Result<Self, BundlerError> {
-        let code =
-            hex::decode(cfg.entrypoint_simulations_code.trim_start_matches("0x")).map_err(|e| {
-                BundlerError::InvalidBatch(Box::leak(
-                    format!("invalid ENTRYPOINT_SIMULATIONS_CODE hex: {e}").into_boxed_str(),
-                ))
-            })?;
         Ok(Self {
             cfg,
             provider,
             signer,
-            simulations_code: Bytes::from(code),
+            simulations_code: default_simulations_code(),
         })
     }
 

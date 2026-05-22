@@ -20,7 +20,7 @@ make build
 
 # Configure
 cp .env.example .env
-$EDITOR .env                       # set CHAIN_ID, EXEC_RPC_URL, SEQUENCER_KEY, ENTRYPOINT_SIMULATIONS_CODE
+$EDITOR .env                       # set CHAIN_ID, EXEC_RPC_URL, SEQUENCER_KEY
 
 # Run
 set -a; source .env; set +a
@@ -86,7 +86,6 @@ All settings are exposed as both CLI flags and `ETHERA_BUNDLER_*` env vars. See
 | `ETHERA_BUNDLER_CHAIN_ID`                    | *required*     | Chain ID the bundler signs for                 |
 | `ETHERA_BUNDLER_EXEC_RPC_URL`                | *required*     | Execution-layer JSON-RPC endpoint              |
 | `ETHERA_BUNDLER_ENTRYPOINT_ADDRESS`          | canonical v0.7 | `EntryPoint` contract address                  |
-| `ETHERA_BUNDLER_ENTRYPOINT_SIMULATIONS_CODE` | *required*     | `EntryPointSimulations` runtime bytecode (hex) |
 | `ETHERA_BUNDLER_SEQUENCER_KEY`               | *required*     | Sequencer EOA private key (32-byte hex)        |
 | `ETHERA_BUNDLER_MAX_BATCH_SIZE`              | `10`           | Maximum `UserOperation`s per request           |
 | `ETHERA_BUNDLER_MIN_PRIORITY_FEE_WEI`        | `1000000000`   | Minimum accepted `maxPriorityFeePerGas` (wei)  |
@@ -130,7 +129,7 @@ make install-hooks   # wire pre-commit into .git/hooks
 ```
 
 Pre-commit then runs `cargo fmt`, `cargo clippy`, `cargo deny`, and
-`cargo machete` on every commit — see [`.pre-commit-config.yaml`](./.pre-commit-config.yaml).
+`cargo machete` on every commit - see [`.pre-commit-config.yaml`](./.pre-commit-config.yaml).
 
 Toolchain pinned to Rust 1.91 via [`rust-toolchain.toml`](./rust-toolchain.toml).
 Workspace-wide lints (including `clippy::pedantic`-style rules) are configured
