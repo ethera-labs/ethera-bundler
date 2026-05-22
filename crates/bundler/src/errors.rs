@@ -65,6 +65,9 @@ pub enum BundlerError {
         deposit: String,
     },
 
+    #[error("bundler is shutting down")]
+    Cancelled,
+
     #[error(transparent)]
     Pack(#[from] PackError),
 
@@ -136,6 +139,10 @@ pub fn classify(err: &BundlerError) -> (i32, Value) {
                 "required": required,
                 "deposit": deposit,
             }),
+        ),
+        BundlerError::Cancelled => (
+            codes::INTERNAL_ERROR,
+            json!({ "reason": "shutdown in progress" }),
         ),
         BundlerError::Pack(e) => (codes::INVALID_PARAMS, json!({ "reason": e.to_string() })),
         BundlerError::Validation(e) => match e {

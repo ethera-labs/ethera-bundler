@@ -22,6 +22,8 @@ use alloy::consensus::TxEip1559;
 use alloy::eips::eip2718::Encodable2718;
 use alloy::primitives::{Bytes, TxKind, B256, U256};
 use alloy::sol_types::SolCall;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::BundlerConfig;
 use crate::contracts::{IEntryPoint, PackedUserOperation};
@@ -37,6 +39,14 @@ pub struct Bundler<P: EthProvider + ?Sized, S: Signer + ?Sized> {
     provider: Arc<P>,
     signer: Arc<S>,
     simulations_code: Bytes,
+    /// Serializes the nonce-take + sign step across concurrent build calls and
+    /// caches the next nonce so two callers don't both fetch `pending_nonce`
+    /// and sign with the same value.
+    nonce_state: Mutex<Option<u64>>,
+    /// External shutdown signal. The build pipeline races on it and returns
+    /// [`BundlerError::Cancelled`] when fired, so a SIGINT doesn't have to
+    /// wait for a wedged provider call.
+    cancel: CancellationToken,
 }
 
 /// Default simulations runtime - the embedded ERC-4337 v0.7
@@ -58,15 +68,38 @@ impl<P: EthProvider + ?Sized, S: Signer + ?Sized> std::fmt::Debug for Bundler<P,
 
 impl<P: EthProvider + ?Sized, S: Signer + ?Sized> Bundler<P, S> {
     pub fn new(cfg: BundlerConfig, provider: Arc<P>, signer: Arc<S>) -> Result<Self, BundlerError> {
+        Self::with_cancellation(cfg, provider, signer, CancellationToken::new())
+    }
+
+    pub fn with_cancellation(
+        cfg: BundlerConfig,
+        provider: Arc<P>,
+        signer: Arc<S>,
+        cancel: CancellationToken,
+    ) -> Result<Self, BundlerError> {
         Ok(Self {
             cfg,
             provider,
             signer,
             simulations_code: default_simulations_code(),
+            nonce_state: Mutex::new(None),
+            cancel,
         })
     }
 
     pub async fn build_signed_user_ops_tx(
+        &self,
+        ops: Vec<UserOpV07>,
+        opts: BuildOpts,
+    ) -> Result<SignedTxResp, BundlerError> {
+        tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => Err(BundlerError::Cancelled),
+            res = self.build_inner(ops, opts) => res,
+        }
+    }
+
+    async fn build_inner(
         &self,
         ops: Vec<UserOpV07>,
         opts: BuildOpts,
@@ -142,7 +175,11 @@ impl<P: EthProvider + ?Sized, S: Signer + ?Sized> Bundler<P, S> {
             min_user_fee_cap.expect("non-empty batch"),
         )?;
 
-        let nonce = self.provider.pending_nonce(beneficiary).await?;
+        let mut nonce_slot = self.nonce_state.lock().await;
+        let nonce = match *nonce_slot {
+            Some(n) => n,
+            None => self.provider.pending_nonce(beneficiary).await?,
+        };
 
         let tx = TxEip1559 {
             chain_id: self.cfg.chain_id,
@@ -157,6 +194,9 @@ impl<P: EthProvider + ?Sized, S: Signer + ?Sized> Bundler<P, S> {
         };
 
         let envelope = self.signer.sign_eip1559(tx).await?;
+        *nonce_slot = Some(nonce.saturating_add(1));
+        drop(nonce_slot);
+
         let raw = Bytes::from(envelope.encoded_2718());
         let hash = *envelope.tx_hash();
 

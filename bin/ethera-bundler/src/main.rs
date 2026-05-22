@@ -1,5 +1,7 @@
 //! `ethera-bundler` binary entrypoint: clap config → provider + signer → JSON-RPC server.
 
+mod startup;
+
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -11,6 +13,7 @@ use ethera_bundler_core::provider::AlloyProvider;
 use ethera_bundler_core::rpc::{BundlerRpc, EtheraBundlerApiServer};
 use ethera_bundler_core::signer::{LocalSigner, Signer};
 use jsonrpsee::server::Server;
+use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -40,8 +43,19 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(LocalSigner::from_key(cfg.sequencer_key).context("failed to load sequencer key")?);
     tracing::info!(sequencer = %signer.address(), "sequencer signer loaded");
 
+    startup::probe(
+        provider.as_ref(),
+        cfg.chain_id,
+        cfg.entrypoint_address,
+        signer.address(),
+    )
+    .await
+    .context("startup probe failed")?;
+
+    let cancel = CancellationToken::new();
     let bundler = Arc::new(
-        Bundler::new(cfg.clone(), provider, signer).context("failed to construct bundler")?,
+        Bundler::with_cancellation(cfg.clone(), provider, signer, cancel.clone())
+            .context("failed to construct bundler")?,
     );
     let listen_addr = cfg.listen_addr;
     let discovery = DiscoveryRpc::new(cfg.chain_id, cfg.entrypoint_address);
@@ -74,7 +88,8 @@ async fn main() -> anyhow::Result<()> {
     tokio::signal::ctrl_c()
         .await
         .context("ctrl_c handler failed")?;
-    tracing::info!("ctrl-c received; shutting down");
+    tracing::info!("ctrl-c received; cancelling in-flight work and stopping server");
+    cancel.cancel();
     handle.stop().ok();
     handle.stopped().await;
     Ok(())

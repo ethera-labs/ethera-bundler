@@ -33,6 +33,14 @@ pub trait EthProvider: Send + Sync + 'static {
     async fn max_priority_fee(&self) -> Result<U256, ProviderError>;
     async fn pending_nonce(&self, addr: Address) -> Result<u64, ProviderError>;
 
+    /// EOA balance at the latest block. Used by the startup probe to surface
+    /// an unfunded sequencer key before serving any traffic.
+    async fn balance(&self, addr: Address) -> Result<U256, ProviderError>;
+
+    /// Deployed code at `addr` at the latest block. An empty return means the
+    /// address holds no code (EOA or non-existent contract).
+    async fn get_code(&self, addr: Address) -> Result<Bytes, ProviderError>;
+
     async fn balance_of(
         &self,
         entrypoint: Address,
@@ -120,6 +128,20 @@ impl EthProvider for AlloyProvider {
         self.inner
             .get_transaction_count(addr)
             .pending()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))
+    }
+
+    async fn balance(&self, addr: Address) -> Result<U256, ProviderError> {
+        self.inner
+            .get_balance(addr)
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))
+    }
+
+    async fn get_code(&self, addr: Address) -> Result<Bytes, ProviderError> {
+        self.inner
+            .get_code_at(addr)
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))
     }

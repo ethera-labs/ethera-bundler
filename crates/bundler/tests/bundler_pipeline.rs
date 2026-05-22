@@ -54,6 +54,12 @@ impl EthProvider for MockProvider {
     async fn pending_nonce(&self, _addr: Address) -> Result<u64, ProviderError> {
         Ok(TEST_NONCE)
     }
+    async fn balance(&self, _addr: Address) -> Result<U256, ProviderError> {
+        Ok(U256::from(TEST_DEPOSIT))
+    }
+    async fn get_code(&self, _addr: Address) -> Result<Bytes, ProviderError> {
+        Ok(Bytes::from_static(b"\x00\x01\x02"))
+    }
     async fn balance_of(&self, _ep: Address, _account: Address) -> Result<U256, ProviderError> {
         Ok(self.deposit)
     }
@@ -260,6 +266,43 @@ async fn rejects_insufficient_deposit() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("insufficient deposit"), "got: {err}");
+}
+
+/// Two back-to-back builds against the same `Bundler` must produce a
+/// monotonically increasing nonce, even though `MockProvider::pending_nonce`
+/// always returns `TEST_NONCE`. Regression test for the cached nonce mutex
+/// that prevents the same nonce from being signed twice under concurrency.
+#[tokio::test]
+async fn sequential_builds_increment_nonce_locally() {
+    let cfg = test_config();
+    let signer = Arc::new(LocalSigner::from_key(TEST_KEY).unwrap());
+    let bundler = Bundler::new(cfg, Arc::new(MockProvider::default()), signer).unwrap();
+    let opts = BuildOpts {
+        chain_id: TEST_CHAIN_ID,
+    };
+
+    let first = bundler
+        .build_signed_user_ops_tx(vec![happy_op()], opts.clone())
+        .await
+        .unwrap();
+    let second = bundler
+        .build_signed_user_ops_tx(vec![happy_op()], opts)
+        .await
+        .unwrap();
+
+    let first_tx = decode_eip1559(&first.raw);
+    let second_tx = decode_eip1559(&second.raw);
+    assert_eq!(first_tx.nonce, TEST_NONCE);
+    assert_eq!(second_tx.nonce, TEST_NONCE + 1);
+}
+
+fn decode_eip1559(raw: &Bytes) -> alloy::consensus::TxEip1559 {
+    let envelope =
+        TxEnvelope::decode_2718(&mut raw.as_ref()).expect("raw must be EIP-2718-encoded");
+    let TxEnvelope::Eip1559(signed) = envelope else {
+        panic!("expected EIP-1559 envelope, got {envelope:?}");
+    };
+    signed.tx().clone()
 }
 
 // Convenience for the test: expose the signer's address without dragging in
