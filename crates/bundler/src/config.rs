@@ -49,11 +49,9 @@ pub struct BundlerConfig {
     #[arg(long, env = "ETHERA_BUNDLER_MAX_BATCH_SIZE", default_value_t = 10)]
     pub max_batch_size: usize,
 
-    /// Minimum priority fee the bundler accepts on a userop, in wei.
-    ///
-    /// Userops with `maxPriorityFeePerGas` below this are rejected with `-32602`.
-    /// Default: 1 gwei.
-    #[arg(long, env = "ETHERA_BUNDLER_MIN_PRIORITY_FEE_WEI", default_value_t = U256::from_limbs([1_000_000_000, 0, 0, 0]))]
+    /// Minimum `maxPriorityFeePerGas` (wei) accepted on a userop.
+    /// Userops below this are rejected with `-32602`. Default: 1 Mwei (0.001 Gwei).
+    #[arg(long, env = "ETHERA_BUNDLER_MIN_PRIORITY_FEE_WEI", default_value_t = U256::from_limbs([1_000_000, 0, 0, 0]))]
     pub min_priority_fee_wei: U256,
 
     /// Safety margin added on top of `eth_estimateGas` for `handleOps`, in percent.
