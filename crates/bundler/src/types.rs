@@ -55,6 +55,17 @@ pub struct UserOpV07 {
 #[serde(rename_all = "camelCase")]
 pub struct BuildOpts {
     pub chain_id: u64,
+    /// If `true`, broadcast the signed `handleOps` tx via
+    /// `eth_sendRawTransaction` and await its receipt before returning.
+    /// If `false`, sign only and return the raw envelope without contacting
+    /// the execution layer; the caller is responsible for relaying the tx.
+    /// Defaults to `true`.
+    #[serde(default = "default_submit")]
+    pub submit: bool,
+}
+
+const fn default_submit() -> bool {
+    true
 }
 
 /// Successful response: a fully signed type-2 tx ready for `eth_sendRawTransaction`,
