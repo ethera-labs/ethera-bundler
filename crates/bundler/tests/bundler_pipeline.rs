@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use alloy::consensus::TxEnvelope;
@@ -33,6 +34,15 @@ const TEST_USER_OP_HASH: B256 =
 struct MockProvider {
     deposit: U256,
     submissions: Arc<std::sync::Mutex<Vec<Bytes>>>,
+    /// Mutable so tests can simulate the chain's pending nonce advancing
+    /// between build calls (e.g. an external sequencer tx).
+    pending_nonce: Arc<AtomicU64>,
+    /// When `true`, `send_raw_transaction` returns an error without recording
+    /// the submission. Used to exercise the send-failure cache-invalidation path.
+    fail_send: Arc<AtomicBool>,
+    /// When `true`, `wait_for_receipt` returns `Ok(None)` to simulate a
+    /// timeout. Used to exercise the receipt-timeout cache-invalidation path.
+    timeout_receipt: Arc<AtomicBool>,
 }
 
 impl Default for MockProvider {
@@ -40,6 +50,9 @@ impl Default for MockProvider {
         Self {
             deposit: U256::from(TEST_DEPOSIT),
             submissions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            pending_nonce: Arc::new(AtomicU64::new(TEST_NONCE)),
+            fail_send: Arc::new(AtomicBool::new(false)),
+            timeout_receipt: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -56,7 +69,7 @@ impl EthProvider for MockProvider {
         Ok(U256::from(TEST_TIP))
     }
     async fn pending_nonce(&self, _addr: Address) -> Result<u64, ProviderError> {
-        Ok(TEST_NONCE)
+        Ok(self.pending_nonce.load(Ordering::Relaxed))
     }
     async fn balance(&self, _addr: Address) -> Result<U256, ProviderError> {
         Ok(U256::from(TEST_DEPOSIT))
@@ -75,6 +88,9 @@ impl EthProvider for MockProvider {
         Ok(TEST_USER_OP_HASH)
     }
     async fn send_raw_transaction(&self, raw: Bytes) -> Result<B256, ProviderError> {
+        if self.fail_send.load(Ordering::Relaxed) {
+            return Err(ProviderError::Transport("nonce too low".into()));
+        }
         let envelope = TxEnvelope::decode_2718(&mut raw.as_ref())
             .map_err(|e| ProviderError::Decode(e.to_string()))?;
         let hash = *envelope.tx_hash();
@@ -86,6 +102,9 @@ impl EthProvider for MockProvider {
         hash: B256,
         _timeout: Duration,
     ) -> Result<Option<ReceiptInfo>, ProviderError> {
+        if self.timeout_receipt.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         Ok(Some(ReceiptInfo {
             tx_hash: hash,
             block_number: 1,
@@ -192,6 +211,7 @@ async fn run(
             ops,
             BuildOpts {
                 chain_id: TEST_CHAIN_ID,
+                submit: true,
             },
         )
         .await
@@ -247,7 +267,13 @@ async fn rejects_wrong_chain_id() {
     let bundler = Bundler::new(cfg, Arc::new(MockProvider::default()), signer).unwrap();
 
     let err = bundler
-        .build_signed_user_ops_tx(vec![happy_op()], BuildOpts { chain_id: 999 })
+        .build_signed_user_ops_tx(
+            vec![happy_op()],
+            BuildOpts {
+                chain_id: 999,
+                submit: true,
+            },
+        )
         .await
         .unwrap_err()
         .to_string();
@@ -268,6 +294,7 @@ async fn rejects_priority_fee_below_minimum() {
             vec![op],
             BuildOpts {
                 chain_id: TEST_CHAIN_ID,
+                submit: true,
             },
         )
         .await
@@ -291,6 +318,7 @@ async fn rejects_insufficient_deposit() {
             vec![happy_op()],
             BuildOpts {
                 chain_id: TEST_CHAIN_ID,
+                submit: true,
             },
         )
         .await
@@ -312,6 +340,7 @@ async fn build_submits_raw_transaction_to_provider() {
     let bundler = Bundler::new(cfg, Arc::new(provider), signer).unwrap();
     let opts = BuildOpts {
         chain_id: TEST_CHAIN_ID,
+        submit: true,
     };
 
     let resp = bundler
@@ -322,6 +351,157 @@ async fn build_submits_raw_transaction_to_provider() {
     let captured = submissions.lock().unwrap().clone();
     assert_eq!(captured.len(), 1);
     assert_eq!(captured[0], resp.raw);
+}
+
+/// With `submit: false` the bundler signs the envelope and returns it
+/// without calling `send_raw_transaction`.
+#[tokio::test]
+async fn sign_only_does_not_broadcast() {
+    let provider = MockProvider::default();
+    let submissions = provider.submissions.clone();
+    let cfg = test_config();
+    let signer = Arc::new(LocalSigner::from_key(TEST_KEY).unwrap());
+    let bundler = Bundler::new(cfg, Arc::new(provider), signer).unwrap();
+
+    let resp = bundler
+        .build_signed_user_ops_tx(
+            vec![happy_op()],
+            BuildOpts {
+                chain_id: TEST_CHAIN_ID,
+                submit: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        submissions.lock().unwrap().is_empty(),
+        "sign-only path must not call send_raw_transaction"
+    );
+    // The response is still complete: raw is what the caller forwards onward,
+    // hash is the eventual on-chain hash they can poll for.
+    assert_eq!(resp.chain_id, TEST_CHAIN_ID);
+    assert!(!resp.raw.is_empty());
+    let envelope =
+        TxEnvelope::decode_2718(&mut resp.raw.as_ref()).expect("raw must be EIP-2718-encoded");
+    assert_eq!(*envelope.tx_hash(), resp.hash);
+}
+
+/// When the chain's `pending_nonce` advances past the bundler's cache between
+/// build calls (e.g. an external sequencer tx), the next sign must use the
+/// chain value rather than the stale cache.
+#[tokio::test]
+async fn reconciles_cache_against_advancing_chain_pending() {
+    let provider = MockProvider::default();
+    let chain_nonce = provider.pending_nonce.clone();
+    let cfg = test_config();
+    let signer = Arc::new(LocalSigner::from_key(TEST_KEY).unwrap());
+    let bundler = Bundler::new(cfg, Arc::new(provider), signer).unwrap();
+    let opts = BuildOpts {
+        chain_id: TEST_CHAIN_ID,
+        submit: true,
+    };
+
+    // First call signs at TEST_NONCE and advances the cache to TEST_NONCE + 1.
+    let first = bundler
+        .build_signed_user_ops_tx(vec![happy_op()], opts.clone())
+        .await
+        .unwrap();
+    assert_eq!(decode_eip1559_nonce(&first.raw), TEST_NONCE);
+
+    // External sequencer activity moves the chain forward past the cache.
+    chain_nonce.store(TEST_NONCE + 5, Ordering::Relaxed);
+
+    // Second call must follow the chain, not the cached TEST_NONCE + 1.
+    let second = bundler
+        .build_signed_user_ops_tx(vec![happy_op()], opts)
+        .await
+        .unwrap();
+    assert_eq!(decode_eip1559_nonce(&second.raw), TEST_NONCE + 5);
+}
+
+/// If `send_raw_transaction` fails (e.g. node returns "nonce too low"), the
+/// cache must be cleared so the next call refetches `pending_nonce` instead
+/// of looping forever on the rejected value.
+#[tokio::test]
+async fn clears_cache_on_send_failure() {
+    let provider = MockProvider::default();
+    let fail = provider.fail_send.clone();
+    let chain_nonce = provider.pending_nonce.clone();
+    let submissions = provider.submissions.clone();
+    let cfg = test_config();
+    let signer = Arc::new(LocalSigner::from_key(TEST_KEY).unwrap());
+    let bundler = Bundler::new(cfg, Arc::new(provider), signer).unwrap();
+    let opts = BuildOpts {
+        chain_id: TEST_CHAIN_ID,
+        submit: true,
+    };
+
+    // Force the next submission to fail; the bundler must surface the error
+    // without retaining the rejected nonce in the cache.
+    fail.store(true, Ordering::Relaxed);
+    bundler
+        .build_signed_user_ops_tx(vec![happy_op()], opts.clone())
+        .await
+        .expect_err("send failure should propagate");
+    assert!(submissions.lock().unwrap().is_empty());
+
+    // Simulate the chain advancing (the rejected tx was redundant; some other
+    // path consumed the nonce). The next build must refetch and sign at the
+    // new chain pending, not loop on the stale value.
+    fail.store(false, Ordering::Relaxed);
+    chain_nonce.store(TEST_NONCE + 3, Ordering::Relaxed);
+    let resp = bundler
+        .build_signed_user_ops_tx(vec![happy_op()], opts)
+        .await
+        .unwrap();
+    assert_eq!(decode_eip1559_nonce(&resp.raw), TEST_NONCE + 3);
+}
+
+/// If `wait_for_receipt` times out, the cache (already advanced before the
+/// wait) must be invalidated so the next call refetches `pending_nonce`
+/// instead of riding the speculative value into a pool gap.
+#[tokio::test]
+async fn clears_cache_on_receipt_timeout() {
+    let provider = MockProvider::default();
+    let timeout = provider.timeout_receipt.clone();
+    let chain_nonce = provider.pending_nonce.clone();
+    let cfg = test_config();
+    let signer = Arc::new(LocalSigner::from_key(TEST_KEY).unwrap());
+    let bundler = Bundler::new(cfg, Arc::new(provider), signer).unwrap();
+    let opts = BuildOpts {
+        chain_id: TEST_CHAIN_ID,
+        submit: true,
+    };
+
+    timeout.store(true, Ordering::Relaxed);
+    let err = bundler
+        .build_signed_user_ops_tx(vec![happy_op()], opts.clone())
+        .await
+        .expect_err("receipt timeout must surface as an error");
+    assert!(
+        err.to_string().contains("not found within timeout"),
+        "got: {err}"
+    );
+
+    // After the timeout the cache must be empty. Advance the chain and assert
+    // the next sign reads chain_pending, not the stale cached value.
+    timeout.store(false, Ordering::Relaxed);
+    chain_nonce.store(TEST_NONCE + 4, Ordering::Relaxed);
+    let resp = bundler
+        .build_signed_user_ops_tx(vec![happy_op()], opts)
+        .await
+        .unwrap();
+    assert_eq!(decode_eip1559_nonce(&resp.raw), TEST_NONCE + 4);
+}
+
+fn decode_eip1559_nonce(raw: &Bytes) -> u64 {
+    let envelope =
+        TxEnvelope::decode_2718(&mut raw.as_ref()).expect("raw must be EIP-2718-encoded");
+    match envelope {
+        TxEnvelope::Eip1559(signed) => signed.tx().nonce,
+        other => panic!("expected EIP-1559 envelope, got {other:?}"),
+    }
 }
 
 // Convenience for the test: expose the signer's address without dragging in
