@@ -44,25 +44,11 @@ pub struct Bundler<P: EthProvider + ?Sized, S: Signer + ?Sized> {
     provider: Arc<P>,
     signer: Arc<S>,
     simulations_code: Bytes,
-    /// Serializes nonce assignment across concurrent build calls.
-    ///
-    /// `None` triggers a fresh `pending_nonce` lookup on the next sign;
-    /// `Some(n)` is the next sequencer nonce to hand out. The lock is held
-    /// across the critical section that reads the cached value, signs the
-    /// envelope, and - when [`BuildOpts::submit`] is `true` - broadcasts
-    /// the tx. Advancing the counter only inside the lock guarantees that
-    /// two concurrent build calls never sign with the same nonce.
-    ///
-    /// When [`BuildOpts::submit`] is `false` the counter still advances
-    /// speculatively because the alternative would let a concurrent call
-    /// re-sign the same nonce. If the caller never relays the returned tx,
-    /// the chain pool sees a nonce gap until a later submitted tx fills it.
-    ///
-    /// Note: an alternative design would read `latest` instead of `pending`
-    /// and hold the lock through `wait_for_receipt`, so the next caller only
-    /// fetches after the previous tx has mined. That trades throughput
-    /// (~1 build per block) for not issuing nonces against in-flight txs.
-    nonce_cache: Mutex<Option<u64>>,
+    /// Held in submit mode to make the read-nonce → broadcast sequence atomic,
+    /// so concurrent submits never sign the same nonce. The bundler keeps no
+    /// nonce state: the execution layer's pending nonce is authoritative and
+    /// already accounts for in-flight transactions and released reservations.
+    submit_lock: Mutex<()>,
     /// External shutdown signal. The build pipeline races on it and returns
     /// [`BundlerError::Cancelled`] when fired, so a SIGINT doesn't have to
     /// wait for a wedged provider call.
@@ -102,7 +88,7 @@ impl<P: EthProvider + ?Sized, S: Signer + ?Sized> Bundler<P, S> {
             provider,
             signer,
             simulations_code: default_simulations_code(),
-            nonce_cache: Mutex::new(None),
+            submit_lock: Mutex::new(()),
             cancel,
         })
     }
@@ -195,17 +181,18 @@ impl<P: EthProvider + ?Sized, S: Signer + ?Sized> Bundler<P, S> {
             min_user_fee_cap.expect("non-empty batch"),
         )?;
 
-        let mut nonce_slot = self.nonce_cache.lock().await;
-        // Reconcile the local cache against the node's view: the cache covers
-        // the in-flight window where a just-submitted tx hasn't yet reached
-        // the pending pool, while `pending_nonce` covers any external sequencer
-        // activity that advanced the chain past our cache. Taking the max of
-        // the two keeps the bundler self-healing on both fronts.
-        let chain_pending = self.provider.pending_nonce(beneficiary).await?;
-        let nonce = match *nonce_slot {
-            Some(cached) if cached > chain_pending => cached,
-            _ => chain_pending,
+        // The pending nonce is the source of truth; the bundler caches nothing.
+        // Submit mode locks the read-and-broadcast so concurrent submits draw
+        // distinct nonces. Sign-only signs at the current pending nonce and
+        // returns; the caller relays the raw tx and a stale or duplicate nonce
+        // is rejected by the execution layer rather than wedging the signer.
+        let _guard = if opts.submit {
+            Some(self.submit_lock.lock().await)
+        } else {
+            None
         };
+
+        let nonce = self.provider.pending_nonce(beneficiary).await?;
 
         let tx = TxEip1559 {
             chain_id: self.cfg.chain_id,
@@ -223,38 +210,16 @@ impl<P: EthProvider + ?Sized, S: Signer + ?Sized> Bundler<P, S> {
         let raw = Bytes::from(envelope.encoded_2718());
         let hash = *envelope.tx_hash();
 
-        let next_nonce = nonce
-            .checked_add(1)
-            .ok_or(BundlerError::NonceOverflow { nonce })?;
-
         if opts.submit {
-            // Broadcast inside the lock so the next caller's `pending_nonce`
-            // already accounts for this tx. The receipt wait happens outside
-            // the lock so concurrent build calls stay parallel.
-            let submitted = match self.provider.send_raw_transaction(raw.clone()).await {
-                Ok(hash) => hash,
-                Err(err) => {
-                    // Drop the cache so the next call refetches `pending_nonce`
-                    // instead of looping forever on a stale value (e.g. when
-                    // the node rejected this tx with "nonce too low").
-                    *nonce_slot = None;
-                    return Err(err.into());
-                }
-            };
+            let submitted = self.provider.send_raw_transaction(raw.clone()).await?;
             debug_assert_eq!(submitted, hash, "submitted hash must match signed envelope");
-            *nonce_slot = Some(next_nonce);
-            drop(nonce_slot);
+            drop(_guard);
 
             let Some(receipt) = self
                 .provider
                 .wait_for_receipt(hash, RECEIPT_TIMEOUT)
                 .await?
             else {
-                // Drop the cache so the next call refetches `pending_nonce`.
-                // If this tx eventually mines, the next sign at the same
-                // nonce will be rejected with "nonce too low" and the send-
-                // error path above will clear the cache again.
-                *self.nonce_cache.lock().await = None;
                 return Err(BundlerError::ReceiptTimeout { tx_hash: hash });
             };
             if !receipt.success {
@@ -272,20 +237,6 @@ impl<P: EthProvider + ?Sized, S: Signer + ?Sized> Bundler<P, S> {
                     reason,
                 });
             }
-        } else {
-            // Sign-only: caller relays the raw tx. Advance the local nonce so
-            // a concurrent build call signs the next value, not this one. If
-            // the caller never relays, the cache stays ahead of the chain
-            // until a later submit either matches it (caller eventually
-            // broadcasts) or fails and clears the cache via the send-error
-            // path above.
-            //
-            // TODO(nonce): mixed-mode race. A sign-only call followed by a
-            // submitting call broadcasts `n+1` before `n` lands in the pool;
-            // the pool queues `n+1` behind the gap until the caller relays
-            // `n`. No fail-fast detection or outstanding-nonce tracking yet.
-            *nonce_slot = Some(next_nonce);
-            drop(nonce_slot);
         }
 
         Ok(SignedTxResp {

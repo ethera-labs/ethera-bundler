@@ -34,15 +34,17 @@ const TEST_USER_OP_HASH: B256 =
 struct MockProvider {
     deposit: U256,
     submissions: Arc<std::sync::Mutex<Vec<Bytes>>>,
-    /// Mutable so tests can simulate the chain's pending nonce advancing
-    /// between build calls (e.g. an external sequencer tx).
+    /// The execution layer's pending nonce. Tests mutate it to model a nonce
+    /// being reserved (advance) or released after an abort (drop back down).
     pending_nonce: Arc<AtomicU64>,
-    /// When `true`, `send_raw_transaction` returns an error without recording
-    /// the submission. Used to exercise the send-failure cache-invalidation path.
+    /// When `true`, `send_raw_transaction` fails without recording the
+    /// submission.
     fail_send: Arc<AtomicBool>,
-    /// When `true`, `wait_for_receipt` returns `Ok(None)` to simulate a
-    /// timeout. Used to exercise the receipt-timeout cache-invalidation path.
+    /// When `true`, `wait_for_receipt` returns `Ok(None)` to simulate a timeout.
     timeout_receipt: Arc<AtomicBool>,
+    /// When `true`, a successful `send_raw_transaction` bumps `pending_nonce`,
+    /// modelling the execution layer accepting the tx.
+    advance_pending_on_send: Arc<AtomicBool>,
 }
 
 impl Default for MockProvider {
@@ -53,6 +55,7 @@ impl Default for MockProvider {
             pending_nonce: Arc::new(AtomicU64::new(TEST_NONCE)),
             fail_send: Arc::new(AtomicBool::new(false)),
             timeout_receipt: Arc::new(AtomicBool::new(false)),
+            advance_pending_on_send: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -95,6 +98,9 @@ impl EthProvider for MockProvider {
             .map_err(|e| ProviderError::Decode(e.to_string()))?;
         let hash = *envelope.tx_hash();
         self.submissions.lock().unwrap().push(raw);
+        if self.advance_pending_on_send.load(Ordering::Relaxed) {
+            self.pending_nonce.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(hash)
     }
     async fn wait_for_receipt(
@@ -387,47 +393,53 @@ async fn sign_only_does_not_broadcast() {
     assert_eq!(*envelope.tx_hash(), resp.hash);
 }
 
-/// When the chain's `pending_nonce` advances past the bundler's cache between
-/// build calls (e.g. an external sequencer tx), the next sign must use the
-/// chain value rather than the stale cache.
+/// Sign-only builds always sign at the execution layer's pending nonce. When a
+/// reserved nonce is released after an abort, the pending nonce drops back and
+/// the next build reuses it, so an aborted cross-chain leg never wedges the
+/// signer behind a permanent gap.
 #[tokio::test]
-async fn reconciles_cache_against_advancing_chain_pending() {
+async fn sign_only_follows_builder_pending() {
     let provider = MockProvider::default();
-    let chain_nonce = provider.pending_nonce.clone();
+    let pending = provider.pending_nonce.clone();
     let cfg = test_config();
     let signer = Arc::new(LocalSigner::from_key(TEST_KEY).unwrap());
     let bundler = Bundler::new(cfg, Arc::new(provider), signer).unwrap();
     let opts = BuildOpts {
         chain_id: TEST_CHAIN_ID,
-        submit: true,
+        submit: false,
     };
 
-    // First call signs at TEST_NONCE and advances the cache to TEST_NONCE + 1.
     let first = bundler
         .build_signed_user_ops_tx(vec![happy_op()], opts.clone())
         .await
         .unwrap();
     assert_eq!(decode_eip1559_nonce(&first.raw), TEST_NONCE);
 
-    // External sequencer activity moves the chain forward past the cache.
-    chain_nonce.store(TEST_NONCE + 5, Ordering::Relaxed);
-
-    // Second call must follow the chain, not the cached TEST_NONCE + 1.
+    // The leg is reserved: pending advances.
+    pending.store(TEST_NONCE + 1, Ordering::Relaxed);
     let second = bundler
+        .build_signed_user_ops_tx(vec![happy_op()], opts.clone())
+        .await
+        .unwrap();
+    assert_eq!(decode_eip1559_nonce(&second.raw), TEST_NONCE + 1);
+
+    // The cross-chain xT aborts: the reservation is freed and pending drops.
+    pending.store(TEST_NONCE, Ordering::Relaxed);
+    let third = bundler
         .build_signed_user_ops_tx(vec![happy_op()], opts)
         .await
         .unwrap();
-    assert_eq!(decode_eip1559_nonce(&second.raw), TEST_NONCE + 5);
+    assert_eq!(decode_eip1559_nonce(&third.raw), TEST_NONCE);
 }
 
-/// If `send_raw_transaction` fails (e.g. node returns "nonce too low"), the
-/// cache must be cleared so the next call refetches `pending_nonce` instead
-/// of looping forever on the rejected value.
+/// A failed broadcast surfaces the error and records no submission. The next
+/// build reads the pending nonce afresh, so a transient failure never leaves
+/// the bundler stuck on a stale value.
 #[tokio::test]
-async fn clears_cache_on_send_failure() {
+async fn send_failure_propagates_and_refetches_pending() {
     let provider = MockProvider::default();
     let fail = provider.fail_send.clone();
-    let chain_nonce = provider.pending_nonce.clone();
+    let pending = provider.pending_nonce.clone();
     let submissions = provider.submissions.clone();
     let cfg = test_config();
     let signer = Arc::new(LocalSigner::from_key(TEST_KEY).unwrap());
@@ -437,8 +449,6 @@ async fn clears_cache_on_send_failure() {
         submit: true,
     };
 
-    // Force the next submission to fail; the bundler must surface the error
-    // without retaining the rejected nonce in the cache.
     fail.store(true, Ordering::Relaxed);
     bundler
         .build_signed_user_ops_tx(vec![happy_op()], opts.clone())
@@ -446,11 +456,8 @@ async fn clears_cache_on_send_failure() {
         .expect_err("send failure should propagate");
     assert!(submissions.lock().unwrap().is_empty());
 
-    // Simulate the chain advancing (the rejected tx was redundant; some other
-    // path consumed the nonce). The next build must refetch and sign at the
-    // new chain pending, not loop on the stale value.
     fail.store(false, Ordering::Relaxed);
-    chain_nonce.store(TEST_NONCE + 3, Ordering::Relaxed);
+    pending.store(TEST_NONCE + 3, Ordering::Relaxed);
     let resp = bundler
         .build_signed_user_ops_tx(vec![happy_op()], opts)
         .await
@@ -458,14 +465,13 @@ async fn clears_cache_on_send_failure() {
     assert_eq!(decode_eip1559_nonce(&resp.raw), TEST_NONCE + 3);
 }
 
-/// If `wait_for_receipt` times out, the cache (already advanced before the
-/// wait) must be invalidated so the next call refetches `pending_nonce`
-/// instead of riding the speculative value into a pool gap.
+/// A receipt timeout surfaces as an error. The next build reads the pending
+/// nonce afresh, with no carried-over state from the timed-out attempt.
 #[tokio::test]
-async fn clears_cache_on_receipt_timeout() {
+async fn receipt_timeout_propagates_and_refetches_pending() {
     let provider = MockProvider::default();
     let timeout = provider.timeout_receipt.clone();
-    let chain_nonce = provider.pending_nonce.clone();
+    let pending = provider.pending_nonce.clone();
     let cfg = test_config();
     let signer = Arc::new(LocalSigner::from_key(TEST_KEY).unwrap());
     let bundler = Bundler::new(cfg, Arc::new(provider), signer).unwrap();
@@ -484,15 +490,56 @@ async fn clears_cache_on_receipt_timeout() {
         "got: {err}"
     );
 
-    // After the timeout the cache must be empty. Advance the chain and assert
-    // the next sign reads chain_pending, not the stale cached value.
     timeout.store(false, Ordering::Relaxed);
-    chain_nonce.store(TEST_NONCE + 4, Ordering::Relaxed);
+    pending.store(TEST_NONCE + 4, Ordering::Relaxed);
     let resp = bundler
         .build_signed_user_ops_tx(vec![happy_op()], opts)
         .await
         .unwrap();
     assert_eq!(decode_eip1559_nonce(&resp.raw), TEST_NONCE + 4);
+}
+
+/// `submit_lock` serializes concurrent submit-mode builds: each one reads the
+/// pending nonce and broadcasts atomically, so racing calls draw distinct,
+/// contiguous nonces rather than colliding on the same one.
+#[tokio::test]
+async fn submit_mode_serializes_concurrent_nonces() {
+    const CONCURRENCY: u64 = 8;
+
+    let provider = MockProvider::default();
+    provider
+        .advance_pending_on_send
+        .store(true, Ordering::Relaxed);
+    let cfg = test_config();
+    let signer = Arc::new(LocalSigner::from_key(TEST_KEY).unwrap());
+    let bundler = Arc::new(Bundler::new(cfg, Arc::new(provider), signer).unwrap());
+
+    let handles: Vec<_> = (0..CONCURRENCY)
+        .map(|_| {
+            let bundler = bundler.clone();
+            tokio::spawn(async move {
+                bundler
+                    .build_signed_user_ops_tx(
+                        vec![happy_op()],
+                        BuildOpts {
+                            chain_id: TEST_CHAIN_ID,
+                            submit: true,
+                        },
+                    )
+                    .await
+                    .unwrap()
+            })
+        })
+        .collect();
+
+    let mut nonces = Vec::with_capacity(CONCURRENCY as usize);
+    for handle in handles {
+        nonces.push(decode_eip1559_nonce(&handle.await.unwrap().raw));
+    }
+    nonces.sort_unstable();
+
+    let expected: Vec<u64> = (TEST_NONCE..TEST_NONCE + CONCURRENCY).collect();
+    assert_eq!(nonces, expected, "nonces must be distinct and contiguous");
 }
 
 fn decode_eip1559_nonce(raw: &Bytes) -> u64 {
