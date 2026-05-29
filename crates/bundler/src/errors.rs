@@ -81,9 +81,6 @@ pub enum BundlerError {
         reason: HandleOpsRevertReason,
     },
 
-    #[error("sequencer nonce overflow at {nonce}")]
-    NonceOverflow { nonce: u64 },
-
     #[error(transparent)]
     Pack(#[from] PackError),
 
@@ -175,10 +172,6 @@ pub fn classify(err: &BundlerError) -> (i32, Value) {
             payload["blockNumber"] = json!(block_number);
             (code, payload)
         }
-        BundlerError::NonceOverflow { nonce } => (
-            codes::INTERNAL_ERROR,
-            json!({ "reason": "nonceOverflow", "nonce": nonce }),
-        ),
         BundlerError::Pack(e) => (codes::INVALID_PARAMS, json!({ "reason": e.to_string() })),
         BundlerError::Validation(e) => match e {
             ValidationError::AccountSignatureFailed => (
